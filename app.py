@@ -1,4 +1,10 @@
+import hmac
 import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import zipfile
 
 import streamlit as st
@@ -18,9 +24,12 @@ st.markdown("""
 .agent{border-left:3px solid #c2410c;padding:6px 0 6px 12px;margin:10px 0}
 </style>""", unsafe_allow_html=True)
 
-import hmac
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORK = os.path.join(tempfile.gettempdir(), "pdfslim")
+os.makedirs(WORK, exist_ok=True)
 
 
+# ---------------- password gate ----------------
 def check_password() -> bool:
     """Team password gate. Password lives in Streamlit Secrets as APP_PASSWORD."""
     if st.session_state.get("auth_ok"):
@@ -53,6 +62,7 @@ if not check_password():
 def fmt(b: float) -> str:
     return f"{b / 1048576:.2f} MB" if b >= 1048576 else f"{b / 1024:.1f} KB"
 
+
 # ---------------- sidebar settings ----------------
 with st.sidebar:
     st.header("Settings")
@@ -77,7 +87,7 @@ with st.sidebar:
     subset = st.checkbox("Subset embedded fonts (experimental)", False)
     st.divider()
     if st.button("🔒 Log out"):
-        st.session_state.pop("auth_ok", None)
+        st.session_state.clear()
         st.rerun()
     st.caption("Built on [PyMuPDF](https://pymupdf.readthedocs.io/) · Text and vectors are never rasterised.")
 
@@ -86,21 +96,51 @@ st.write("Shrink PDFs without losing text, line work or detail. Upload drawings,
 
 files = st.file_uploader("Drop PDFs here", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
 
+if mode in ("auto", "lossless", "prepress", "print"):
+    base = pdfslim.PRESETS["prepress" if mode == "auto" else mode]
+    label = "Auto" if mode == "auto" else base["label"]
+else:
+    base = {"images": True, "dpi": int(c_dpi), "quality": int(c_q)}
+    label = f"Custom {c_dpi} DPI / Q{c_q}"
+opts = {"mode": mode, "images": base["images"], "dpi": base["dpi"], "quality": base["quality"],
+        "strip_editor": strip_editor, "strip_metadata": strip_meta, "subset_fonts": subset}
+opts_key = json.dumps(opts, sort_keys=True)
 
-@st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
-def run_analysis(data: bytes):
-    return pdfslim.analyze(data)
 
-
-@st.cache_data(show_spinner=False, max_entries=3, ttl=1800)
-def run_compress(data: bytes, opts: tuple):
-    o = dict(opts)
-    out, rep = pdfslim.compress(data, **o)
-    kept = len(out) >= len(data)
-    if kept:
-        out = data
-    v = {"pages": [], "checked": 0, "total": 0} if kept else pdfslim.verify(data, out)
-    return out, rep.__dict__, v, kept
+def run_job(file_id: str, data: bytes) -> dict:
+    """Run compression in a separate process; return result dict or {'error': ...}."""
+    jobs = st.session_state.setdefault("jobs", {})
+    key = f"{file_id}|{opts_key}"
+    if key in jobs:
+        return jobs[key]
+    # forget older results for this file to save memory
+    for k in [k for k in jobs if k.startswith(file_id + "|")]:
+        old = jobs.pop(k)
+        if old.get("out_path") and os.path.exists(old["out_path"]):
+            os.remove(old["out_path"])
+    src = os.path.join(WORK, f"{file_id}.in.pdf")
+    dst = os.path.join(WORK, f"{file_id}.{abs(hash(opts_key))}.out.pdf")
+    res = os.path.join(WORK, f"{file_id}.json")
+    with open(src, "wb") as f:
+        f.write(data)
+    try:
+        p = subprocess.run([sys.executable, os.path.join(HERE, "job.py"), src, dst, res, opts_key],
+                           capture_output=True, text=True, timeout=900, cwd=HERE)
+    except subprocess.TimeoutExpired:
+        return {"error": "Took longer than 15 minutes. The file is too heavy for the free server."}
+    if p.returncode != 0 or not os.path.exists(res):
+        tail = (p.stderr or "").strip().splitlines()[-1:] or [f"exit code {p.returncode}"]
+        killed = p.returncode in (-9, 137) or "MemoryError" in (p.stderr or "")
+        msg = ("Ran out of memory on the free server. Try a smaller file, or split it into parts."
+               if killed else f"Processing failed: {tail[0]}")
+        return {"error": msg}
+    with open(res) as f:
+        r = json.load(f)
+    os.remove(res)
+    r["out_path"] = dst
+    r["src_path"] = src
+    jobs[key] = r
+    return r
 
 
 CATS = [("images", "Images", "#c2410c"), ("fonts", "Fonts", "#2563eb"), ("content", "Page drawing", "#0f766e"),
@@ -125,17 +165,19 @@ def explain(a):
 
 results = []
 for f in files or []:
-    data = f.getvalue()
+    fid = f.file_id
+    size_in = f.size
     with st.container(border=True):
         head = st.columns([4, 1])
         head[0].markdown(f"**{f.name}**")
-        head[1].markdown(f"<div style='text-align:right;opacity:.7'>{fmt(len(data))}</div>", unsafe_allow_html=True)
-        try:
-            with st.spinner("Reading file structure…"):
-                a = run_analysis(data)
-        except Exception as e:
-            st.error(f"Couldn't open this PDF ({e}). If it's password-protected, remove the password first.")
+        head[1].markdown(f"<div style='text-align:right;opacity:.7'>{fmt(size_in)}</div>", unsafe_allow_html=True)
+
+        with st.spinner(f"Compressing ({label}) and checking every page…"):
+            r = run_job(fid, f.getvalue())
+        if "error" in r:
+            st.error(r["error"])
             continue
+        a = r["analysis"]
 
         tot = sum(a["cats"].values()) or 1
         bar = "".join(f"<span style='width:{100 * a['cats'][k] / tot}%;background:{c}'></span>" for k, _, c in CATS if a["cats"][k])
@@ -143,21 +185,11 @@ for f in files or []:
         st.markdown(f"<div class='bar'>{bar}</div><div class='legend'>{leg}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='agent'>\n\n{explain(a)}\n\n</div>", unsafe_allow_html=True)
 
-        chosen = a["recommended"] if mode == "auto" else mode
-        base = {"images": True, "dpi": int(c_dpi), "quality": int(c_q), "label": f"Custom {c_dpi} DPI / Q{c_q}"} \
-            if chosen == "custom" else pdfslim.PRESETS[chosen]
-        opts = (("images", base["images"]), ("dpi", base["dpi"]), ("quality", base["quality"]),
-                ("strip_editor", strip_editor), ("strip_metadata", strip_meta), ("subset_fonts", subset))
-        try:
-            with st.spinner(f"Compressing with {base['label']} and checking every page…"):
-                out, rep, v, kept = run_compress(data, opts)
-        except Exception as e:
-            st.error(f"Compression failed: {e}")
-            continue
-
-        saved = 1 - len(out) / len(data)
+        kept, v, rep = r["kept"], r["verify"], r["report"]
+        size_out = r["size"]
+        saved = 1 - size_out / size_in
         m1, m2, m3 = st.columns([1.1, 2.2, 1])
-        m1.metric("New size", fmt(len(out)), f"-{saved * 100:.1f}%" if saved > 0.0005 else "no change", delta_color="inverse")
+        m1.metric("New size", fmt(size_out), f"-{saved * 100:.1f}%" if saved > 0.0005 else "no change", delta_color="inverse")
         if kept:
             m2.success("**Unchanged.** This file is already well optimised, so you get the original back byte for byte.")
         else:
@@ -171,9 +203,12 @@ for f in files or []:
             else:
                 m2.warning(f"**Check detail.** Worst page PSNR {min_p:.1f} dB. Try Prepress or Lossless.")
         name = f.name.rsplit(".", 1)[0] + "-slim.pdf"
-        m3.download_button("⬇ Download", out, file_name=name, mime="application/pdf", type="primary", use_container_width=True, key=f"dl-{f.file_id}")
-        m3.caption(f"Mode: {base['label']}" + (" (auto)" if mode == "auto" else ""))
-        results.append((name, out, len(data)))
+        with open(r["out_path"], "rb") as fh:
+            m3.download_button("⬇ Download", fh.read(), file_name=name, mime="application/pdf", type="primary",
+                               width="stretch", key=f"dl-{fid}")
+        used = a["recommended"] if mode == "auto" else mode
+        m3.caption(f"Mode: {pdfslim.PRESETS.get(used, {'label': label})['label']}" + (" (auto)" if mode == "auto" else ""))
+        results.append((name, r["out_path"], size_in, size_out))
 
         with st.expander("What changed"):
             st.code("\n".join([
@@ -182,31 +217,37 @@ for f in files or []:
                 f"Kept lossless (line art, masks, bitonal, palette): {rep['kept_lossless']}",
                 f"Left as-is (already efficient or small): {rep['skipped']}", *rep["notes"]]), language=None)
 
-        if not kept:
-            with st.expander("🔍 Compare detail: zoom into both files side by side"):
-                c = st.columns(4)
-                pg = c[0].selectbox("Page", range(len(a["pages"])), format_func=lambda i: str(i + 1), key=f"pg-{f.file_id}")
-                dpi = c[1].selectbox("Zoom", [150, 300, 600], index=1, format_func=lambda d: f"{d} DPI", key=f"z-{f.file_id}")
-                fx = c[2].slider("Across (%)", 0, 100, 50, key=f"x-{f.file_id}") / 100
-                fy = c[3].slider("Down (%)", 0, 100, 50, key=f"y-{f.file_id}") / 100
-                ov_png, pw, ph = pdfslim.render_page(out, pg, 900)
+        if not kept and st.toggle("🔍 Compare detail: zoom into both files side by side", key=f"cmp-{fid}"):
+            c = st.columns(4)
+            pg = c[0].selectbox("Page", range(len(a["pages"])), format_func=lambda i: str(i + 1), key=f"pg-{fid}")
+            dpi = c[1].selectbox("Zoom", [150, 300, 600], index=1, format_func=lambda d: f"{d} DPI", key=f"z-{fid}")
+            fx = c[2].slider("Across (%)", 0, 100, 50, key=f"x-{fid}") / 100
+            fy = c[3].slider("Down (%)", 0, 100, 50, key=f"y-{fid}") / 100
+            try:
+                with open(r["out_path"], "rb") as fh:
+                    out_bytes = fh.read()
+                with open(r["src_path"], "rb") as fh:
+                    src_bytes = fh.read()
+                ov_png, pw, ph = pdfslim.render_page(out_bytes, pg, 900)
                 ov = Image.open(io.BytesIO(ov_png)).convert("RGB")
                 side = 600 / dpi * 72
                 sx, sy = ov.width / pw, ov.height / ph
-                cx, cy = fx * pw, fy * ph
-                x0 = max(0, min(pw - side, cx - side / 2)); y0 = max(0, min(ph - side, cy - side / 2))
+                x0 = max(0, min(pw - side, fx * pw - side / 2)); y0 = max(0, min(ph - side, fy * ph - side / 2))
                 ImageDraw.Draw(ov).rectangle([x0 * sx, y0 * sy, (x0 + side) * sx, (y0 + side) * sy], outline=(194, 65, 12), width=3)
                 v1, v2, v3 = st.columns([1.2, 1, 1])
-                v1.image(ov, caption="Page (orange box = area shown)", use_container_width=True)
-                v2.image(pdfslim.render_region(data, pg, fx, fy, dpi), caption="Original", use_container_width=True)
-                v3.image(pdfslim.render_region(out, pg, fx, fy, dpi), caption="Compressed", use_container_width=True)
+                v1.image(ov, caption="Page (orange box = area shown)", width="stretch")
+                v2.image(pdfslim.render_region(src_bytes, pg, fx, fy, dpi), caption="Original", width="stretch")
+                v3.image(pdfslim.render_region(out_bytes, pg, fx, fy, dpi), caption="Compressed", width="stretch")
+                del out_bytes, src_bytes
+            except Exception as e:
+                st.warning(f"Couldn't render the comparison: {e}")
 
 if len(results) > 1:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
-        for n, b, _ in results:
-            z.writestr(n, b)
-    before = sum(r[2] for r in results); after = sum(len(r[1]) for r in results)
+        for n, path, _, _ in results:
+            z.write(path, n)
+    before = sum(r[2] for r in results); after = sum(r[3] for r in results)
     st.download_button(f"⬇ Download all ({len(results)} files, {fmt(before)} → {fmt(after)})", buf.getvalue(),
                        file_name="pdf-slim.zip", mime="application/zip", type="primary")
 
