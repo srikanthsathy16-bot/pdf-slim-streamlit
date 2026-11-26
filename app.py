@@ -87,12 +87,12 @@ st.write("Shrink PDFs without losing text, line work or detail. Upload drawings,
 files = st.file_uploader("Drop PDFs here", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
 
 
-@st.cache_data(show_spinner=False, max_entries=20)
+@st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
 def run_analysis(data: bytes):
     return pdfslim.analyze(data)
 
 
-@st.cache_data(show_spinner=False, max_entries=20)
+@st.cache_data(show_spinner=False, max_entries=3, ttl=1800)
 def run_compress(data: bytes, opts: tuple):
     o = dict(opts)
     out, rep = pdfslim.compress(data, **o)

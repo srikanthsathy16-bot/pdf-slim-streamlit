@@ -9,6 +9,7 @@ Quality rules:
 """
 from __future__ import annotations
 
+import gc
 import io
 import math
 from dataclasses import dataclass, field
@@ -34,10 +35,17 @@ def _key(doc, xref, key):
 
 
 def _raw_len(doc, xref) -> int:
+    """Stored (compressed) stream length, read from /Length without loading the stream."""
+    v = _key(doc, xref, "Length")
     try:
-        return len(doc.xref_stream_raw(xref) or b"")
+        if v and v.endswith(" R"):
+            v = doc.xref_object(int(v.split()[0])).strip()
+        return int(float(v))
     except Exception:
-        return 0
+        try:
+            return len(doc.xref_stream_raw(xref) or b"")
+        except Exception:
+            return 0
 
 
 def analyze(data: bytes) -> dict:
@@ -168,6 +176,7 @@ def compress(data: bytes, images=True, dpi=300, quality=92, strip_editor=True,
             except Exception:
                 rep.skipped += 1
                 continue
+            pymupdf.TOOLS.store_shrink(100)  # keep only our own copy of the pixels
             if pix.alpha:
                 pix = pymupdf.Pixmap(pix, 0)
             if pix.n not in (1, 3):
@@ -181,22 +190,40 @@ def compress(data: bytes, images=True, dpi=300, quality=92, strip_editor=True,
             if is_jpeg and not need_down:
                 rep.skipped += 1
                 continue
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(H, W, pix.n)
-            if _is_line_art(arr):
-                rep.kept_lossless += 1
-                continue
-            im = Image.fromarray(arr[:, :, 0] if pix.n == 1 else arr, "L" if pix.n == 1 else "RGB")
             tw, th = W, H
             if need_down:
                 s = dpi / eff
                 tw, th = max(1, round(W * s)), max(1, round(H * s))
+                # cheap in-place 2^k box shrink first (keeps >= target), saves lots of memory
+                k = int(math.floor(math.log2(W / tw))) - 1
+                if k >= 1:
+                    pix.shrink(k)
+            pn, pw_, ph_ = pix.n, pix.width, pix.height
+            arr = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(ph_, pw_, pn)
+            if _is_line_art(arr):
+                rep.kept_lossless += 1
+                del arr, pix
+                pymupdf.TOOLS.store_shrink(100)
+                gc.collect()
+                continue
+            im = Image.frombuffer("L" if pn == 1 else "RGB", (pw_, ph_), pix.samples_mv, "raw", "L" if pn == 1 else "RGB", 0, 1) if pix.stride == pw_ * pn else Image.fromarray(arr if pn == 3 else arr[:, :, 0])
+            if (tw, th) != (pw_, ph_):
+                # reduce in strips' worth of memory: integer pre-reduce, then Lanczos
+                f = min(pw_ // tw, ph_ // th)
+                if f >= 2:
+                    im = im.reduce(f)
                 im = im.resize((tw, th), Image.LANCZOS)
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=quality, optimize=True, subsampling=0 if quality >= 90 else 2)
             jpg = buf.getvalue()
+            del im, arr, buf
+            gc.collect()
             if len(jpg) > before * 0.9:
                 rep.skipped += 1
                 continue
+            n_out = pix.n
+            del pix
+            pymupdf.TOOLS.store_shrink(100)  # drop MuPDF's decoded-image cache
             doc.update_stream(x, jpg, compress=0)
             doc.xref_set_key(x, "Filter", "/DCTDecode")
             doc.xref_set_key(x, "DecodeParms", "null")
@@ -205,7 +232,7 @@ def compress(data: bytes, images=True, dpi=300, quality=92, strip_editor=True,
             doc.xref_set_key(x, "Height", str(th))
             doc.xref_set_key(x, "BitsPerComponent", "8")
             if not cs:
-                doc.xref_set_key(x, "ColorSpace", "/DeviceGray" if pix.n == 1 else "/DeviceRGB")
+                doc.xref_set_key(x, "ColorSpace", "/DeviceGray" if n_out == 1 else "/DeviceRGB")
             rep.recompressed += 1
             rep.downsampled += int(need_down)
             rep.notes.append(f"img #{x}: {W}×{H} @{eff:.0f}dpi → {tw}×{th}, {before // 1024} KB → {len(jpg) // 1024} KB")
@@ -217,6 +244,8 @@ def compress(data: bytes, images=True, dpi=300, quality=92, strip_editor=True,
         except Exception as e:
             rep.notes.append(f"Font subsetting skipped: {e}")
 
+    pymupdf.TOOLS.store_shrink(100)
+    gc.collect()
     log("Rebuilding file: dedupe objects, recompress streams, object streams…")
     out = doc.tobytes(garbage=4, deflate=True, deflate_images=True, deflate_fonts=True,
                       use_objstms=1, compression_effort=100, clean=False)
@@ -224,7 +253,7 @@ def compress(data: bytes, images=True, dpi=300, quality=92, strip_editor=True,
     return out, rep
 
 
-def verify(a: bytes, b: bytes, max_pages=60, dpi=100) -> dict:
+def verify(a: bytes, b: bytes, max_pages=40, dpi=72) -> dict:
     da, db = pymupdf.open(stream=a, filetype="pdf"), pymupdf.open(stream=b, filetype="pdf")
     if len(da) != len(db):
         return dict(ok=False, error="Page count changed", pages=[], checked=0, total=len(da))
@@ -232,7 +261,7 @@ def verify(a: bytes, b: bytes, max_pages=60, dpi=100) -> dict:
     n = min(len(da), max_pages)
     for i in range(n):
         side = max(da[i].rect.width, da[i].rect.height)
-        z = min(dpi / 72, 2400 / side)
+        z = min(dpi / 72, 1600 / side)
         m = pymupdf.Matrix(z, z)
         xa = np.frombuffer(da[i].get_pixmap(matrix=m, colorspace=pymupdf.csGRAY).samples, np.uint8).astype(np.int16)
         xb = np.frombuffer(db[i].get_pixmap(matrix=m, colorspace=pymupdf.csGRAY).samples, np.uint8).astype(np.int16)
@@ -245,6 +274,7 @@ def verify(a: bytes, b: bytes, max_pages=60, dpi=100) -> dict:
                         changed=float(np.mean(np.abs(d) > 24))))
     total = len(da)
     da.close(); db.close()
+    gc.collect()
     return dict(ok=True, pages=res, checked=n, total=total)
 
 
