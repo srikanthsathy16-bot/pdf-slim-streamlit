@@ -18,6 +18,38 @@ st.markdown("""
 .agent{border-left:3px solid #c2410c;padding:6px 0 6px 12px;margin:10px 0}
 </style>""", unsafe_allow_html=True)
 
+import hmac
+
+
+def check_password() -> bool:
+    """Team password gate. Password lives in Streamlit Secrets as APP_PASSWORD."""
+    if st.session_state.get("auth_ok"):
+        return True
+    try:
+        expected = st.secrets.get("APP_PASSWORD", "")
+    except Exception:
+        expected = ""
+    if not expected:
+        st.error("Password not configured. Add APP_PASSWORD in the app's Settings → Secrets.")
+        return False
+    st.title("📄 PDF Slim")
+    st.caption("Team access. Enter the password to continue.")
+    with st.form("login"):
+        pw = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Enter", type="primary")
+    if ok:
+        if hmac.compare_digest(pw.encode(), str(expected).encode()):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
 def fmt(b: float) -> str:
     return f"{b / 1048576:.2f} MB" if b >= 1048576 else f"{b / 1024:.1f} KB"
 
@@ -44,6 +76,9 @@ with st.sidebar:
     strip_meta = st.checkbox("Remove XMP metadata", False)
     subset = st.checkbox("Subset embedded fonts (experimental)", False)
     st.divider()
+    if st.button("🔒 Log out"):
+        st.session_state.pop("auth_ok", None)
+        st.rerun()
     st.caption("Built on [PyMuPDF](https://pymupdf.readthedocs.io/) · Text and vectors are never rasterised.")
 
 st.title("📄 PDF Slim")
